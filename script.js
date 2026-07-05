@@ -27,7 +27,11 @@ document.addEventListener('DOMContentLoaded', () => {
             sortNameAsc: "Name (A-Z)",
             sortNameDesc: "Name (Z-A)",
             sortSizeAsc: "Size (Smallest)",
-            sortSizeDesc: "Size (Largest)"
+            sortSizeDesc: "Size (Largest)",
+            extracting: "Extracting...",
+            fileSizeTooLarge: "File size exceeds 500MB limit.",
+            corruptedPackage: "Package appears to be corrupted.",
+            processingComplete: "Processing complete!"
         },
         ja: {
             title: "開ける君",
@@ -56,7 +60,11 @@ document.addEventListener('DOMContentLoaded', () => {
             sortNameAsc: "名前順 (昇順)",
             sortNameDesc: "名前順 (降順)",
             sortSizeAsc: "サイズ順 (小さい順)",
-            sortSizeDesc: "サイズ順 (大きい順)"
+            sortSizeDesc: "サイズ順 (大きい順)",
+            extracting: "抽出中...",
+            fileSizeTooLarge: "ファイルサイズが500MBを超えています。",
+            corruptedPackage: "パッケージが破損している可能性があります。",
+            processingComplete: "処理が完了しました！"
         },
         ko: {
             title: "Package Extractor",
@@ -85,20 +93,31 @@ document.addEventListener('DOMContentLoaded', () => {
             sortNameAsc: "이름순 (A-Z)",
             sortNameDesc: "이름순 (Z-A)",
             sortSizeAsc: "크기순 (작은순)",
-            sortSizeDesc: "크기순 (큰순)"
+            sortSizeDesc: "크기순 (큰순)",
+            extracting: "추출 중...",
+            fileSizeTooLarge: "파일 크기가 500MB를 초과합니다.",
+            corruptedPackage: "패키지가 손상되었을 수 있습니다.",
+            processingComplete: "처리 완료!"
         }
+    };
+
+    const CONFIG = {
+        MAX_FILE_SIZE: 500 * 1024 * 1024, // 500MB
+        ITEMS_PER_PAGE: 100,
+        WORKER_AVAILABLE: typeof Worker !== 'undefined'
     };
 
     let extractedFiles = {};
     let activeObjectUrls = [];
     let selectedPaths = new Set();
+    let worker = null;
+    let isProcessing = false;
 
     // Drag & Shift Selection State
     let isDragging = false;
-    let dragMode = true; // true = select, false = deselect
+    let dragMode = true;
     let lastSelectedPath = null;
 
-    // Window-level mouseup to stop dragging
     window.addEventListener('mouseup', () => {
         isDragging = false;
     });
@@ -110,7 +129,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const excludeMetaCheckbox = document.getElementById('excludeMeta');
     const categorizeByExtensionCheckbox = document.getElementById('categorizeByExtension');
     const maintainStructureCheckbox = document.getElementById('maintainStructure');
-    // enablePreviewCheckbox removed
     const showFileSizeCheckbox = document.getElementById('showFileSize');
     const checkerboardBgCheckbox = document.getElementById('checkerboardBg');
     const showPngGridCheckbox = document.getElementById('showPngGrid');
@@ -125,6 +143,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const selectionCount = document.getElementById('selectionCount');
     const downloadSelectedBtn = document.getElementById('downloadSelectedBtn');
     const clearSelectionBtn = document.getElementById('clearSelectionBtn');
+
+    // Progress indicator
+    let progressBar = null;
 
     // Create 'Select All' button for Grid
     const gridSelectAllBtn = document.createElement('button');
@@ -147,12 +168,212 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     updateLanguage(currentLanguage);
 
-    // --- Core Logic ---
+    // --- Initialize Web Worker ---
+    function initWorker() {
+        if (CONFIG.WORKER_AVAILABLE) {
+            try {
+                worker = new Worker('worker.js');
+                worker.onmessage = handleWorkerMessage;
+                worker.onerror = (error) => {
+                    console.error('Worker error:', error);
+                    showError('Worker initialization failed', currentLanguage);
+                };
+            } catch (e) {
+                console.warn('Web Worker not available, using main thread', e);
+                worker = null;
+            }
+        }
+    }
+    initWorker();
+
+    // --- Progress UI ---
+    function createProgressBar() {
+        const bar = document.createElement('div');
+        bar.className = 'progress-bar';
+        bar.innerHTML = `
+            <div class="progress-fill"></div>
+            <span class="progress-text">0%</span>
+        `;
+        return bar;
+    }
+
+    function showProgress() {
+        if (!progressBar) {
+            progressBar = createProgressBar();
+            dropZone.insertAdjacentElement('afterend', progressBar);
+        }
+        progressBar.style.display = 'block';
+        updateProgressBar(0);
+    }
+
+    function updateProgressBar(percentage) {
+        if (progressBar) {
+            const fill = progressBar.querySelector('.progress-fill');
+            const text = progressBar.querySelector('.progress-text');
+            fill.style.width = percentage + '%';
+            text.textContent = Math.round(percentage) + '%';
+        }
+    }
+
+    function hideProgress() {
+        if (progressBar) {
+            progressBar.style.display = 'none';
+        }
+    }
+
+    function showError(message, lang) {
+        const errorDiv = document.createElement('div');
+        errorDiv.className = 'error-message';
+        errorDiv.textContent = message || translations[lang].errorMessage;
+        dropZone.insertAdjacentElement('afterend', errorDiv);
+        setTimeout(() => errorDiv.remove(), 5000);
+    }
+
+    // --- Worker Message Handler ---
+    function handleWorkerMessage(event) {
+        const { type, data, error } = event.data;
+
+        if (type === 'progress') {
+            updateProgressBar(data.percentage);
+        } else if (type === 'complete') {
+            hideProgress();
+            if (error) {
+                showError(`${error.message} (${error.code})`, currentLanguage);
+                isProcessing = false;
+            } else {
+                extractedFiles = data;
+                selectedPaths.clear();
+                updateSelectionUI();
+                displayExtractedFiles(extractedFiles);
+                downloadAllBtn.style.display = 'block';
+                isProcessing = false;
+            }
+        }
+    }
+
+    // --- Event Handlers ---
+    dropZone.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.style.opacity = '0.7';
+    });
+
+    dropZone.addEventListener('dragleave', () => {
+        dropZone.style.opacity = '1';
+    });
+
+    dropZone.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dropZone.style.opacity = '1';
+
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+            const file = files[0];
+            if (!file.name.endsWith('.unitypackage')) {
+                alert(translations[currentLanguage].invalidFile);
+                return;
+            }
+            if (file.size > CONFIG.MAX_FILE_SIZE) {
+                alert(translations[currentLanguage].fileSizeTooLarge);
+                return;
+            }
+            await processUnityPackage(file);
+        } else {
+            alert(translations[currentLanguage].invalidFile);
+        }
+    });
+
+    dropZone.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async (e) => {
+        if (e.target.files.length > 0) {
+            const file = e.target.files[0];
+            if (file.size > CONFIG.MAX_FILE_SIZE) {
+                alert(translations[currentLanguage].fileSizeTooLarge);
+                return;
+            }
+            await processUnityPackage(file);
+        }
+    });
+
+    [excludeMetaCheckbox, categorizeByExtensionCheckbox, maintainStructureCheckbox, showFileSizeCheckbox, showPngGridCheckbox, checkerboardBgCheckbox].forEach(cb => {
+        cb.addEventListener('change', () => displayExtractedFiles(extractedFiles));
+    });
+
+    pngGridScale.addEventListener('input', (e) => {
+        const scaleVal = parseInt(e.target.value, 10) || 30;
+        const minSize = 80;
+        const maxSize = 250;
+        const itemSize = minSize + (scaleVal / 100) * (maxSize - minSize);
+        pngGrid.style.setProperty('--grid-item-size', `${Math.floor(itemSize)}px`);
+    });
+
+    sortOrderSelect.addEventListener('change', () => {
+        displayExtractedFiles(extractedFiles);
+    });
+
+    downloadAllBtn.addEventListener('click', downloadAll);
+    downloadSelectedBtn.addEventListener('click', downloadSelected);
+    clearSelectionBtn.addEventListener('click', clearSelection);
+
+    gridSelectAllBtn.addEventListener('click', () => {
+        const gridItems = document.querySelectorAll('.png-node');
+        const allSelected = Array.from(gridItems).every(item => item.classList.contains('selected'));
+        gridItems.forEach(item => {
+            const path = item.dataset.path;
+            allSelected ? selectedPaths.delete(path) : selectedPaths.add(path);
+        });
+        updateSelectionUI();
+        displayExtractedFiles(extractedFiles);
+    });
+
+    // --- Processing ---
+    async function processUnityPackage(file) {
+        if (isProcessing) return;
+        isProcessing = true;
+
+        try {
+            showProgress();
+            dropZone.style.pointerEvents = 'none';
+            dropZone.style.opacity = '0.5';
+
+            const arrayBuffer = await file.arrayBuffer();
+
+            if (worker) {
+                // Use Web Worker for async processing
+                worker.postMessage({
+                    type: 'extract',
+                    data: { arrayBuffer }
+                });
+            } else {
+                // Fallback to main thread
+                const extractor = new UnityExtractClient();
+                const result = await extractor.extract(arrayBuffer);
+                extractedFiles = result;
+                selectedPaths.clear();
+                updateSelectionUI();
+                displayExtractedFiles(extractedFiles);
+                downloadAllBtn.style.display = 'block';
+                hideProgress();
+                isProcessing = false;
+            }
+        } catch (error) {
+            console.error(error);
+            hideProgress();
+            showError(error.message, currentLanguage);
+            isProcessing = false;
+        } finally {
+            dropZone.style.pointerEvents = 'auto';
+            dropZone.style.opacity = '1';
+        }
+    }
+
+    // --- Core Logic (Fallback Main Thread Extraction) ---
     class UnityExtractClient {
-        constructor() { }
+        constructor() {}
 
         async extract(arrayBuffer) {
-            if (typeof fflate === 'undefined') throw new Error("fflate missing");
+            if (typeof fflate === 'undefined') throw new Error('fflate missing');
             const unzipped = fflate.gunzipSync(new Uint8Array(arrayBuffer));
             return this.parseTarball(unzipped);
         }
@@ -187,7 +408,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 const assetPath = `${basePath}/asset`;
                 const metaPath1 = `${basePath}/asset.meta`;
-                const metaPath2 = `${basePath}/metaData`; // Fallback
+                const metaPath2 = `${basePath}/metaData`;
 
                 if (files[assetPath]) convertedFiles[newPath] = files[assetPath];
                 if (files[metaPath1]) convertedFiles[`${newPath}.meta`] = files[metaPath1];
@@ -205,82 +426,8 @@ document.addEventListener('DOMContentLoaded', () => {
         return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
     }
 
-    const extractor = new UnityExtractClient();
-
-    // --- Event Handlers ---
-    dropZone.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); });
-    dropZone.addEventListener('drop', async (e) => {
-        e.preventDefault(); e.stopPropagation();
-        const files = e.dataTransfer.files;
-        if (files.length > 0 && files[0].name.endsWith('.unitypackage')) {
-            await processUnityPackage(files[0]);
-        } else {
-            alert(translations[currentLanguage].invalidFile);
-        }
-    });
-    dropZone.addEventListener('click', () => fileInput.click());
-    fileInput.addEventListener('change', async (e) => {
-        if (e.target.files.length > 0) await processUnityPackage(e.target.files[0]);
-    });
-
-    [excludeMetaCheckbox, categorizeByExtensionCheckbox, maintainStructureCheckbox, showFileSizeCheckbox, showPngGridCheckbox, checkerboardBgCheckbox].forEach(cb => {
-        cb.addEventListener('change', () => displayExtractedFiles(extractedFiles));
-    });
-
-    pngGridScale.addEventListener('input', (e) => {
-        const scaleVal = parseInt(e.target.value, 10) || 30;
-        // Map 0-100 to roughly 80px - 250px
-        const minSize = 80;
-        const maxSize = 250;
-        const itemSize = minSize + (scaleVal / 100) * (maxSize - minSize);
-
-        // Update CSS variable only - almost zero cost
-        pngGrid.style.setProperty('--grid-item-size', `${Math.floor(itemSize)}px`);
-    });
-
-    sortOrderSelect.addEventListener('change', () => {
-        // Trigger re-render to apply new sort order
-        displayExtractedFiles(extractedFiles);
-    });
-
-    downloadAllBtn.addEventListener('click', downloadAll);
-    downloadSelectedBtn.addEventListener('click', downloadSelected);
-    clearSelectionBtn.addEventListener('click', clearSelection);
-
-    gridSelectAllBtn.addEventListener('click', () => {
-        const gridItems = document.querySelectorAll('.png-node');
-        const allSelected = Array.from(gridItems).every(item => item.classList.contains('selected'));
-        gridItems.forEach(item => {
-            const path = item.dataset.path;
-            allSelected ? selectedPaths.delete(path) : selectedPaths.add(path);
-        });
-        updateSelectionUI();
-        displayExtractedFiles(extractedFiles);
-    });
-
-    // --- Processing ---
-    async function processUnityPackage(file) {
-        try {
-            const arrayBuffer = await file.arrayBuffer();
-            extractedFiles = await extractor.extract(arrayBuffer);
-            selectedPaths.clear();
-            updateSelectionUI();
-
-            // Force select the Grid View for PNGs by default if not set
-            // showPngGridCheckbox.checked = true; // User preference? Let's check it by default in HTML actually.
-
-            displayExtractedFiles(extractedFiles);
-            downloadAllBtn.style.display = 'block';
-        } catch (error) {
-            console.error(error);
-            alert(translations[currentLanguage].errorMessage);
-        }
-    }
-
     function toggleFileSelection(path, forceState = null) {
         let isSelected = selectedPaths.has(path);
-
-        // Determine new state
         const newState = forceState !== null ? forceState : !isSelected;
 
         if (newState) {
@@ -289,13 +436,12 @@ document.addEventListener('DOMContentLoaded', () => {
             selectedPaths.delete(path);
         }
 
-        // Update specific node UI immediately for better performance during drag
         const node = document.querySelector(`.png-node[data-path="${CSS.escape(path)}"]`);
         if (node) {
             node.classList.toggle('selected', newState);
         }
 
-        updateSelectionUI(false); // Pass false to skip full DOM sync if optimizing
+        updateSelectionUI(false);
     }
 
     function updateSelectionUI(syncGrid = true) {
@@ -303,12 +449,10 @@ document.addEventListener('DOMContentLoaded', () => {
         selectionCount.textContent = translations[currentLanguage].selectedCount.replace('{0}', count);
         selectionBar.classList.toggle('visible', count > 0);
 
-        // Sync Checkboxes
         document.querySelectorAll('input.file-checkbox').forEach(cb => {
             cb.checked = selectedPaths.has(cb.dataset.path);
         });
 
-        // Sync Grid Items (only if requested, to avoid double-work during internal updates)
         if (syncGrid) {
             document.querySelectorAll('.png-node').forEach(node => {
                 node.classList.toggle('selected', selectedPaths.has(node.dataset.path));
@@ -335,7 +479,6 @@ document.addEventListener('DOMContentLoaded', () => {
             categorizedFiles[extension].push({ path, content });
         }
 
-        // --- Gallery View (Grid) for images ---
         const imageExtensions = ['png', 'jpg', 'jpeg', 'gif', 'bmp'];
         const hasImages = imageExtensions.some(ext => categorizedFiles[ext] && categorizedFiles[ext].length > 0);
 
@@ -343,10 +486,9 @@ document.addEventListener('DOMContentLoaded', () => {
             updatePngGrid(categorizedFiles);
         }
 
-        // --- List View for everything else (or PNGs if grid disabled) ---
         if (categorizeByExtensionCheckbox.checked) {
             for (const [extension, catFiles] of Object.entries(categorizedFiles)) {
-                if (imageExtensions.includes(extension) && showPngGridCheckbox.checked) continue; // Skip images in list if grid is on
+                if (imageExtensions.includes(extension) && showPngGridCheckbox.checked) continue;
 
                 const category = document.createElement('div');
                 category.className = 'category';
@@ -354,7 +496,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 const h3 = document.createElement('h3');
                 h3.textContent = extension.toUpperCase();
 
-                // Select All Button for Category
                 const catSelectBtn = document.createElement('button');
                 catSelectBtn.textContent = translations[currentLanguage].selectAll;
                 catSelectBtn.style.fontSize = '0.7em';
@@ -363,9 +504,8 @@ document.addEventListener('DOMContentLoaded', () => {
                     updateSelectionUI();
                 });
 
-                // Download Category Button
                 const dlBtn = document.createElement('button');
-                dlBtn.textContent = '↓'; // Compact download icon
+                dlBtn.textContent = '↓';
                 dlBtn.title = translations[currentLanguage].downloadCategory.replace('{0}', extension.toUpperCase());
                 dlBtn.addEventListener('click', () => downloadCategory(extension, catFiles));
 
@@ -386,7 +526,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 fileList.appendChild(category);
             }
         } else {
-            // Flat list
             const ul = document.createElement('ul');
             Object.values(categorizedFiles).flat().forEach(file => {
                 if (showPngGridCheckbox.checked && isImageFile(file.path)) return;
@@ -411,13 +550,13 @@ document.addEventListener('DOMContentLoaded', () => {
         const a = document.createElement('a');
         const blob = new Blob([content], { type: 'application/octet-stream' });
         const url = URL.createObjectURL(blob);
+        activeObjectUrls.push(url);
         a.href = url;
         a.textContent = maintainStructureCheckbox.checked ? path : path.split('/').pop();
         a.download = a.textContent;
 
         li.appendChild(checkbox);
         li.appendChild(a);
-
 
         return li;
     }
@@ -427,10 +566,10 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function updatePngGrid(categorizedFiles) {
-        // Cleanup previous URLs to prevent memory leaks
-        if (activeObjectUrls.length > 0) {
-            activeObjectUrls.forEach(url => URL.revokeObjectURL(url));
-            activeObjectUrls = [];
+        // Cleanup previous URLs
+        if (activeObjectUrls.length > CONFIG.ITEMS_PER_PAGE * 2) {
+            const excess = activeObjectUrls.splice(0, activeObjectUrls.length - CONFIG.ITEMS_PER_PAGE * 2);
+            excess.forEach(url => URL.revokeObjectURL(url));
         }
 
         const imageFiles = [];
@@ -446,7 +585,6 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        // Sort Files
         const sortOrder = sortOrderSelect.value;
         imageFiles.sort((a, b) => {
             const pathA = a.path.split('/').pop().toLowerCase();
@@ -464,14 +602,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
         pngGrid.innerHTML = '';
         pngGrid.style.display = 'grid';
-        pngGridControls.style.display = 'flex'; // Enable controls
+        pngGridControls.style.display = 'flex';
 
-        // Append 'Select All' if missing
         if (!pngGridControls.contains(gridSelectAllBtn)) {
             pngGridControls.prepend(gridSelectAllBtn);
         }
 
-        // Initialize size based on current slider value
         const scaleVal = parseInt(pngGridScale.value, 10) || 30;
         const minSize = 80;
         const maxSize = 250;
@@ -485,59 +621,50 @@ document.addEventListener('DOMContentLoaded', () => {
 
             const blob = new Blob([file.content], { type: mimeType });
             const url = URL.createObjectURL(blob);
-            activeObjectUrls.push(url); // Track for cleanup
+            activeObjectUrls.push(url);
 
             const node = document.createElement('div');
             node.className = 'png-node';
-            // Checkerboard class moved to wrapper
             node.dataset.path = file.path;
 
             if (selectedPaths.has(file.path)) node.classList.add('selected');
 
-            // Wrapper for Image and Indicator
             const wrapper = document.createElement('div');
             wrapper.className = 'png-preview-wrapper';
             if (checkerboardBgCheckbox.checked) wrapper.classList.add('checkerboard-bg');
 
-            // Image
             const img = document.createElement('img');
             img.src = url;
-            img.loading = 'lazy'; // Performance
+            img.loading = 'lazy';
 
-            // Selection Indicator Overlay
             const indicator = document.createElement('div');
             indicator.className = 'selection-indicator';
 
             wrapper.appendChild(img);
             wrapper.appendChild(indicator);
 
-            // Filename Label
             const label = document.createElement('div');
             label.className = 'png-label';
             label.textContent = file.path.split('/').pop();
-            label.title = file.path; // Tooltip for full path
+            label.title = file.path;
 
             node.appendChild(label);
             node.appendChild(wrapper);
 
-            // File Size & Type Info
             const info = document.createElement('div');
             info.className = 'png-info';
-            info.textContent = formatFileSize(file.content.length);
+            if (showFileSizeCheckbox.checked) {
+                info.textContent = formatFileSize(file.content.length);
+            }
             node.appendChild(info);
 
-            // Click behavior: Shift, Drag, Click
             node.addEventListener('mousedown', (e) => {
-                if (e.shiftKey) return; // Let click handler handle shift
-                if (e.which !== 1) return; // Only Left Click
+                if (e.shiftKey) return;
+                if (e.which !== 1) return;
 
-                e.preventDefault(); // Prevent text selection
+                e.preventDefault();
                 isDragging = true;
 
-                // If the item is already selected, we might be starting a "deselect" drag.
-                // However, standard behavior for unselected item is "select".
-                // If item IS selected, user might want to drag-deselect OR just click to deselect.
-                // Simple logic: Toggle the current one, and use THAT new state as the drag target.
                 const currentState = selectedPaths.has(file.path);
                 dragMode = !currentState;
 
@@ -545,7 +672,6 @@ document.addEventListener('DOMContentLoaded', () => {
                 lastSelectedPath = file.path;
             });
 
-            // Prevent native drag from interfering with our drag selection
             node.addEventListener('dragstart', (e) => {
                 e.preventDefault();
             });
@@ -559,17 +685,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
             node.addEventListener('click', (e) => {
                 if (e.shiftKey && lastSelectedPath) {
-                    // Range Selection
                     const allNodes = Array.from(document.querySelectorAll('.png-node'));
                     const startIdx = allNodes.findIndex(n => n.dataset.path === lastSelectedPath);
                     const endIdx = allNodes.findIndex(n => n.dataset.path === file.path);
 
                     if (startIdx !== -1 && endIdx !== -1) {
                         const [min, max] = [Math.min(startIdx, endIdx), Math.max(startIdx, endIdx)];
-                        // Determine whether to select or deselect based on the target logic?
-                        // Usually Shift+Click adds to selection (or sets selection).
-                        // Let's assume Add to selection for simplicity, or match the last operation?
-                        // Standard: Select everything in range.
                         for (let i = min; i <= max; i++) {
                             const path = allNodes[i].dataset.path;
                             selectedPaths.add(path);
@@ -577,11 +698,7 @@ document.addEventListener('DOMContentLoaded', () => {
                         updateSelectionUI();
                     }
                 } else {
-                    // Normal click is handled by mousedown for responsiveness, 
-                    // BUT we need to update lastSelectedPath here too if mousedown didn't fire (weird case)
-                    // or just ensure Shift logic has a base.
                     if (!e.shiftKey) {
-                        // Mousedown already handled the toggle. Just update last path.
                         lastSelectedPath = file.path;
                     }
                 }
